@@ -3,13 +3,21 @@ SeedSigner Views for Legacy Encryption
 
 Flow:
   MainMenu → LegacyMainMenuView
-    ├── Encrypt: ScanSeedQR → EnterBenefactorKey → EnterBeneficiaryKey
-    │            → ConfirmEncrypt → EncryptingView → ShowEncryptedQRView
+    ├── Encrypt: LegacyEncryptInputMethodView
+    │    ├── Scan Seed QR → LegacyEncryptScanSeedView
+    │    │                → EnterBenefactorKey → EnterBeneficiaryKey
+    │    │                → ConfirmEncrypt → EncryptingView → ShowEncryptedQRView
+    │    └── Enter Manually → LegacyManualSeedWordCountView
+    │                       → LegacyEnterSeedWordView (×12 or ×24)
+    │                       → EnterBenefactorKey → EnterBeneficiaryKey
+    │                       → ConfirmEncrypt → EncryptingView → ShowEncryptedQRView
     └── Decrypt: ScanEncryptedQR → EnterBenefactorKey → EnterBeneficiaryKey
                  → DecryptingView → ShowDecryptedSeedView → ShowSeedWordsView
 """
 
 import time
+import signal as _signal
+import threading
 
 from seedsigner.views.view import View, Destination, BackStackView
 from seedsigner.gui.screens.screen import (
@@ -37,27 +45,148 @@ from seedsigner.models.encode_qr import GenericStaticQrEncoder
 from seedsigner.helpers.legacy_log import get_logger
 _log = get_logger("legacy.views")
 
+# ---------------------------------------------------------------------------
+# SIGALRM pyzbar timeout — prevents the main thread from hanging if libzbar
+# locks up under memory pressure on the Pi Zero.  SIGALRM is Linux-only but
+# the code degrades gracefully on other platforms (just no timeout).
+# ---------------------------------------------------------------------------
+_HAS_SIGALRM = hasattr(_signal, 'SIGALRM')
+_DECODE_TIMEOUT = 2  # seconds
+
+
+def _sync_loading_frame(text: str) -> None:
+    """Push one loading frame to the display synchronously.
+
+    LoadingScreenThread runs in a daemon thread, so PBKDF2 (a CPU-bound C
+    extension) can starve it before it renders a single frame.  Calling this
+    first guarantees the user sees *something* on screen before the 30-second
+    wait begins.
+    """
+    try:
+        from PIL import Image, ImageDraw
+        from seedsigner.gui.renderer import Renderer
+        from seedsigner.gui.components import GUIConstants, Fonts
+        r = Renderer.get_instance()
+        img = Image.new("RGBA", (r.canvas_width, r.canvas_height), "black")
+        draw = ImageDraw.Draw(img)
+        font = Fonts.get_font(GUIConstants.get_body_font_name(), GUIConstants.get_body_font_size())
+        draw.text(
+            (r.canvas_width // 2, r.canvas_height // 2),
+            text,
+            fill="white",
+            font=font,
+            anchor="mm",
+        )
+        with r.lock:
+            r.show_image(img, show_direct=True)
+    except Exception:
+        pass  # Never block the encrypt/decrypt flow
+
+
+def _sigalrm_call(seconds, fn):
+    """Call fn() and raise TimeoutError if it takes more than `seconds`."""
+    if not _HAS_SIGALRM:
+        return fn()
+
+    def _handler(signum, frame):
+        raise TimeoutError("pyzbar decode timeout")
+
+    old = _signal.signal(_signal.SIGALRM, _handler)
+    _signal.alarm(seconds)
+    try:
+        return fn()
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, old)
+
 
 class _RawQRDecoder(DecodeQR):
     """
     Accepts any QR as raw text — used for scanning the Legacy encrypted payload.
 
-    DecodeQR classifies our base64 blob as INVALID. We bypass its type-detection
-    machinery entirely: call pyzbar directly, capture raw bytes, return COMPLETE
-    so ScanScreen exits cleanly without touching the camera thread state.
+    DecodeQR classifies our base64 blob as INVALID so we bypass its type-detection
+    and call pyzbar directly.
 
-    Pi Zero mitigations:
-    - Process only every 3rd frame (~1 fps at framerate=3) so button checks
-      fire between ZBar calls.
-    - Scan at 320×320 instead of 480×480 — 2.25× fewer pixels, ~2× faster ZBar,
-      much lower OOM risk. Callers must pass resolution=(320, 320) to ScanScreen.
-    - Convert RGB→grayscale (float32) before ZBar: 3× less data, faster decode.
-    - Wrap pyzbar in try/except so any crash returns FALSE instead of hanging.
+    Pi Zero freeze fix — run pyzbar in a daemon thread:
+      SIGALRM cannot interrupt a CPU-bound C extension (libzbar) because Python
+      only processes signals between bytecodes, and libzbar never returns to Python
+      while it is stuck.  The daemon-thread approach keeps the main thread free at
+      all times: we launch a decode thread and return FALSE immediately; on the next
+      frame we check whether the thread finished.  If libzbar hangs forever the
+      daemon thread hangs but the UI stays alive and the user can press back.
+
+    One thread is allowed at a time — if a thread is still running when the next
+    eligible frame arrives we skip that frame rather than pile up threads.
     """
 
     def __init__(self):
         super().__init__(wordlist_language_code="en")
         self._raw_text = None
+        self._frame_count = 0
+        self._worker = None          # active daemon decode thread
+        self._worker_result = None   # written by thread, read by main thread
+
+    def add_image(self, image):
+        self._frame_count += 1
+
+        # Check whether the previous worker finished
+        if self._worker is not None:
+            if not self._worker.is_alive():
+                result = self._worker_result
+                self._worker = None
+                self._worker_result = None
+                if result is not None:
+                    self._raw_text = result
+                    self.complete = True
+                    return DecodeQRStatus.COMPLETE
+                # Thread finished but found nothing — fall through to maybe try again
+            else:
+                # Still running — don't block, skip this frame
+                return DecodeQRStatus.FALSE
+
+        # Rate-limit: only launch a new decode every 3rd frame
+        if self._frame_count % 3 != 0:
+            return DecodeQRStatus.FALSE
+
+        if image is None:
+            return DecodeQRStatus.FALSE
+
+        # Downsample 2x + green channel only: 12x less data than 480×480 RGB
+        small = image[::2, ::2, 1].copy()
+
+        def _decode():
+            try:
+                data = DecodeQR.extract_qr_data(small, is_binary=True)
+                if data is not None:
+                    try:
+                        self._worker_result = data.decode("utf-8").strip()
+                    except Exception:
+                        self._worker_result = data.decode("latin-1").strip()
+            except Exception:
+                pass
+
+        self._worker = threading.Thread(target=_decode, daemon=True)
+        self._worker.start()
+        return DecodeQRStatus.FALSE
+
+    def get_percent_complete(self, weight_mixed_frames: bool = False) -> int:
+        return 100 if self.complete else 0
+
+    def get_raw_text(self):
+        return self._raw_text
+
+
+class _TimeoutDecodeQR(DecodeQR):
+    """DecodeQR with SIGALRM watchdog and frame-rate limiting.
+
+    Skips 2 of every 3 frames and downsamples 2x before passing to pyzbar,
+    keeping ZBar calls to ~1 fps and reducing pixels 4x — same mitigations as
+    _RawQRDecoder.  Without this, every frame at 6 fps goes to ZBar, which
+    blocks the main thread long enough to freeze the UI on Pi Zero.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self._frame_count = 0
 
     def add_image(self, image):
@@ -65,32 +194,19 @@ class _RawQRDecoder(DecodeQR):
         if self._frame_count % 3 != 0:
             return DecodeQRStatus.FALSE
 
-        if image is None:
-            return DecodeQRStatus.FALSE
+        if image is not None:
+            image = image[::2, ::2].copy()
 
         try:
-            import numpy as np
-            gray = np.mean(image, axis=2, dtype=np.float32).astype(np.uint8)
-            data = DecodeQR.extract_qr_data(gray, is_binary=True)
+            return _sigalrm_call(
+                _DECODE_TIMEOUT,
+                lambda: DecodeQR.add_image(self, image),
+            )
+        except TimeoutError:
+            _log.warning("_TimeoutDecodeQR: pyzbar timeout, skipping frame")
+            return DecodeQRStatus.FALSE
         except Exception:
             return DecodeQRStatus.FALSE
-
-        if data is None:
-            return DecodeQRStatus.FALSE
-
-        try:
-            self._raw_text = data.decode("utf-8").strip()
-        except Exception:
-            self._raw_text = data.decode("latin-1").strip()
-
-        self.complete = True
-        return DecodeQRStatus.COMPLETE
-
-    def get_percent_complete(self, weight_mixed_frames: bool = False) -> int:
-        return 100 if self.complete else 0
-
-    def get_raw_text(self):
-        return self._raw_text
 
 
 def _make_key_entry_screen(label: str):
@@ -142,10 +258,122 @@ class LegacyMainMenuView(View):
             return Destination(BackStackView)
 
         if button_data[selected] == self.ENCRYPT:
-            return Destination(LegacyEncryptScanSeedView)
+            return Destination(LegacyEncryptInputMethodView)
 
         if button_data[selected] == self.DECRYPT:
             return Destination(LegacyDecryptScanQRView)
+
+
+# ===================================================================
+# ENCRYPT input method selection
+# ===================================================================
+
+class LegacyEncryptInputMethodView(View):
+    SCAN_QR = ButtonOption("Scan Seed QR")
+    ENTER_MANUALLY = ButtonOption("Enter Manually")
+
+    def run(self) -> Destination:
+        button_data = [self.SCAN_QR, self.ENTER_MANUALLY]
+
+        selected = self.run_screen(
+            ButtonListScreen,
+            title="Encrypt Seed",
+            is_button_text_centered=False,
+            button_data=button_data,
+        )
+
+        if selected == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        if button_data[selected] == self.SCAN_QR:
+            return Destination(LegacyEncryptScanSeedView)
+
+        return Destination(LegacyManualSeedWordCountView)
+
+
+class LegacyManualSeedWordCountView(View):
+    TWELVE = ButtonOption("12 words")
+    TWENTY_FOUR = ButtonOption("24 words")
+
+    def run(self) -> Destination:
+        button_data = [self.TWELVE, self.TWENTY_FOUR]
+
+        selected = self.run_screen(
+            ButtonListScreen,
+            title="Seed Length",
+            is_button_text_centered=True,
+            button_data=button_data,
+        )
+
+        if selected == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        num_words = 12 if button_data[selected] == self.TWELVE else 24
+        self.controller.storage.init_pending_mnemonic(num_words=num_words)
+        return Destination(
+            LegacyEnterSeedWordView,
+            view_args={"cur_word_index": 0, "num_words": num_words},
+        )
+
+
+class LegacyEnterSeedWordView(View):
+    OK = ButtonOption("OK")
+
+    def __init__(self, cur_word_index: int = 0, num_words: int = 12):
+        super().__init__()
+        self.cur_word_index = cur_word_index
+        self.num_words = num_words
+        self.cur_word = self.controller.storage.get_pending_mnemonic_word(cur_word_index)
+
+    def run(self) -> Destination:
+        from seedsigner.gui.screens import seed_screens
+        from seedsigner.models.seed import Seed
+
+        wordlist_lang = self.settings.get_value(SettingsConstants.SETTING__WORDLIST_LANGUAGE)
+        wordlist = Seed.get_wordlist(wordlist_language_code=wordlist_lang)
+
+        ret = self.run_screen(
+            seed_screens.SeedMnemonicEntryScreen,
+            title=f"Word {self.cur_word_index + 1} of {self.num_words}",
+            initial_letters=list(self.cur_word) if self.cur_word else ["a"],
+            wordlist=wordlist,
+        )
+
+        if ret == RET_CODE__BACK_BUTTON:
+            if self.cur_word_index == 0:
+                self.controller.storage.discard_pending_mnemonic()
+            return Destination(BackStackView)
+
+        self.controller.storage.update_pending_mnemonic(ret, self.cur_word_index)
+
+        if self.cur_word_index < self.num_words - 1:
+            return Destination(
+                LegacyEnterSeedWordView,
+                view_args={"cur_word_index": self.cur_word_index + 1, "num_words": self.num_words},
+            )
+
+        # All words entered — collect, validate, and discard from storage
+        words = [
+            self.controller.storage.get_pending_mnemonic_word(i)
+            for i in range(self.num_words)
+        ]
+        seed_phrase = " ".join(words)
+        self.controller.storage.discard_pending_mnemonic()
+
+        if not validate_seed_phrase(seed_phrase):
+            self.run_screen(
+                WarningScreen,
+                title="Invalid Seed",
+                status_headline="Bad Checksum",
+                text="The last word doesn't match the checksum. Check all words carefully and try again.",
+                button_data=[self.OK],
+            )
+            return Destination(LegacyManualSeedWordCountView)
+
+        return Destination(
+            LegacyEnterBenefactorKeyView,
+            view_args={"seed_phrase": seed_phrase, "mode": "encrypt"},
+        )
 
 
 # ===================================================================
@@ -159,7 +387,7 @@ class LegacyEncryptScanSeedView(View):
         _log.info("LegacyEncryptScanSeedView: starting seed QR scan")
         import gc; gc.collect()
         wordlist_lang = self.settings.get_value(SettingsConstants.SETTING__WORDLIST_LANGUAGE)
-        decoder = DecodeQR(wordlist_language_code=wordlist_lang)
+        decoder = _TimeoutDecodeQR(wordlist_language_code=wordlist_lang)
 
         self.run_screen(
             ScanScreen,
@@ -312,9 +540,9 @@ class LegacyEncryptingView(View):
         from seedsigner.hardware.camera import Camera
         Camera.get_instance().stop_video_stream_mode()
 
+        _sync_loading_frame("Encrypting...  (15-30 sec)")
         loading = LoadingScreenThread(text="Encrypting...  (15-30 sec)")
         loading.start()
-        time.sleep(0.3)  # give LoadingScreenThread a frame before PBKDF2 holds the CPU
 
         error = None
         try:
@@ -481,9 +709,10 @@ class LegacyDecryptingView(View):
         from seedsigner.hardware.camera import Camera
         Camera.get_instance().stop_video_stream_mode()
 
+        _sync_loading_frame("Decrypting...  (15-30 sec)")
         loading = LoadingScreenThread(text="Decrypting...  (15-30 sec)")
         loading.start()
-        time.sleep(0.3)  # give LoadingScreenThread a frame before PBKDF2 holds the CPU
+        time.sleep(0.1)  # let LoadingScreenThread render its first frame before PBKDF2 grabs CPU
 
         error = None
         try:

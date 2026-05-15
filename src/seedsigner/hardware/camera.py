@@ -43,6 +43,18 @@ class Camera(Singleton):
         # _video_stream = None (so LivePreviewThread stops drawing) but leaves the
         # PiVideoStream background thread running at ~6 fps with nobody reading.
         # Here we reattach to it — frames are already flowing, no MMAL re-init.
+        _WATCHDOG = 10.0  # seconds without a frame → treat stream as dead
+        if self._parked_stream is not None:
+            ps = self._parked_stream
+            stale = (time.time() - ps.last_capture_time) > _WATCHDOG
+            if stale or ps.is_stopped:
+                _log.warning(
+                    "start_video_stream_mode: parked stream %s (last_frame=%.1fs ago), rebuilding",
+                    "stopped" if ps.is_stopped else "stale",
+                    time.time() - ps.last_capture_time,
+                )
+                self._force_close_stream(ps)
+                self._parked_stream = None
         if self._parked_stream is not None:
             if not self._parked_stream.is_stopped:
                 _log.info("start_video_stream_mode: reusing parked stream, flushing 500ms")
