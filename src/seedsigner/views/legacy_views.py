@@ -13,10 +13,23 @@ Flow:
     │                       → ConfirmEncrypt → EncryptingView → ShowEncryptedQRView
     └── Decrypt: ScanEncryptedQR → EnterBenefactorKey → EnterBeneficiaryKey
                  → DecryptingView → ShowDecryptedSeedView → ShowSeedWordsView
+
+Secret handling
+---------------
+The seed phrase and both keys are NOT passed through each View's ``view_args``.
+view_args are copied into the controller back-stack and would keep a plaintext
+copy of every secret around for the whole flow. Instead all secrets live in a
+single ``_LegacySession`` held on the controller (see ``_session``), the same
+way SeedSigner keeps in-progress secrets on the controller rather than in
+navigation state. The session is cleared at every flow boundary (menu entry,
+successful completion, and after the seed is handed off to SeedSigner storage),
+and the controller's home-wipe also drops it on a power/home exit (see
+``patch_controller.py``). view_args carry only non-secret routing values
+(word counts, page indices).
 """
 
+import gc
 import time
-import signal as _signal
 import threading
 
 from seedsigner.views.view import View, Destination, BackStackView
@@ -26,7 +39,6 @@ from seedsigner.gui.screens.screen import (
     QRDisplayScreen,
     WarningScreen,
     LargeIconStatusScreen,
-    LoadingScreenThread,
     RET_CODE__BACK_BUTTON,
 )
 from seedsigner.gui.screens.scan_screens import ScanScreen
@@ -37,30 +49,56 @@ from seedsigner.helpers.legacy_encryption import (
     encrypt_seed_phrase,
     decrypt_seed_phrase,
     validate_seed_phrase,
+    seed_phrase_error,
     encrypted_to_qr_data,
     qr_data_to_encrypted,
 )
 from seedsigner.models.encode_qr import GenericStaticQrEncoder
 
-from seedsigner.helpers.legacy_log import get_logger
-_log = get_logger("legacy.views")
 
-# ---------------------------------------------------------------------------
-# SIGALRM pyzbar timeout — prevents the main thread from hanging if libzbar
-# locks up under memory pressure on the Pi Zero.  SIGALRM is Linux-only but
-# the code degrades gracefully on other platforms (just no timeout).
-# ---------------------------------------------------------------------------
-_HAS_SIGALRM = hasattr(_signal, 'SIGALRM')
-_DECODE_TIMEOUT = 2  # seconds
+class _LegacySession:
+    """
+    Single home for the secrets of one encrypt/decrypt flow.
+
+    Lives on the controller (``controller.legacy_session``) so there is exactly
+    one copy of each secret, instead of a copy in every View's view_args / the
+    back-stack. ``clear()`` drops the references and forces a collection — the
+    most a CPython program can do, since ``str`` is immutable and cannot be
+    overwritten in place (the same limitation SeedSigner's own seed handling
+    has).
+    """
+
+    __slots__ = ("seed_phrase", "benefactor_key", "beneficiary_key",
+                 "encrypted_data", "mode")
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.seed_phrase = None
+        self.benefactor_key = None
+        self.beneficiary_key = None
+        self.encrypted_data = None
+        self.mode = None
+        gc.collect()
+
+
+def _session(view) -> "_LegacySession":
+    """Return the per-flow secret store on the controller, creating it lazily."""
+    session = getattr(view.controller, "legacy_session", None)
+    if session is None:
+        session = _LegacySession()
+        view.controller.legacy_session = session
+    return session
 
 
 def _sync_loading_frame(text: str) -> None:
-    """Push one loading frame to the display synchronously.
+    """Push one loading frame to the display synchronously, bypassing any active screen thread.
 
-    LoadingScreenThread runs in a daemon thread, so PBKDF2 (a CPU-bound C
-    extension) can starve it before it renders a single frame.  Calling this
-    first guarantees the user sees *something* on screen before the 30-second
-    wait begins.
+    PBKDF2 pins the Pi Zero's single core, so the normal LoadingScreenThread
+    (which animates from a background thread) starves and the device deadlocks.
+    Instead the encrypt/decrypt views run PBKDF2 in a worker thread and call
+    this from the main thread to paint a static progress frame between waits.
     """
     try:
         from PIL import Image, ImageDraw
@@ -83,23 +121,6 @@ def _sync_loading_frame(text: str) -> None:
         pass  # Never block the encrypt/decrypt flow
 
 
-def _sigalrm_call(seconds, fn):
-    """Call fn() and raise TimeoutError if it takes more than `seconds`."""
-    if not _HAS_SIGALRM:
-        return fn()
-
-    def _handler(signum, frame):
-        raise TimeoutError("pyzbar decode timeout")
-
-    old = _signal.signal(_signal.SIGALRM, _handler)
-    _signal.alarm(seconds)
-    try:
-        return fn()
-    finally:
-        _signal.alarm(0)
-        _signal.signal(_signal.SIGALRM, old)
-
-
 class _RawQRDecoder(DecodeQR):
     """
     Accepts any QR as raw text — used for scanning the Legacy encrypted payload.
@@ -108,12 +129,13 @@ class _RawQRDecoder(DecodeQR):
     and call pyzbar directly.
 
     Pi Zero freeze fix — run pyzbar in a daemon thread:
-      SIGALRM cannot interrupt a CPU-bound C extension (libzbar) because Python
-      only processes signals between bytecodes, and libzbar never returns to Python
-      while it is stuck.  The daemon-thread approach keeps the main thread free at
-      all times: we launch a decode thread and return FALSE immediately; on the next
-      frame we check whether the thread finished.  If libzbar hangs forever the
-      daemon thread hangs but the UI stays alive and the user can press back.
+      A CPU-bound C extension (libzbar) cannot be interrupted from the main
+      thread because Python only processes signals between bytecodes and libzbar
+      never returns to Python while it is stuck. The daemon-thread approach keeps
+      the main thread free at all times: we launch a decode thread and return
+      FALSE immediately; on the next frame we check whether the thread finished.
+      If libzbar ever wedges, the daemon thread is abandoned (it dies with the
+      process) but the UI stays alive and the user can press back.
 
     One thread is allowed at a time — if a thread is still running when the next
     eligible frame arrives we skip that frame rather than pile up threads.
@@ -151,17 +173,38 @@ class _RawQRDecoder(DecodeQR):
         if image is None:
             return DecodeQRStatus.FALSE
 
-        # Downsample 2x + green channel only: 12x less data than 480×480 RGB
-        small = image[::2, ::2, 1].copy()
+        # Full-resolution green channel. Encrypted QRs are denser than seed QRs
+        # (Version 10+ vs Version 4-5), so the 2x downsample we used for seed QRs
+        # leaves only ~4 pixels per module on a phone screen — right at pyzbar's
+        # floor. Full res doubles that margin.
+        full_green = image[:, :, 1].copy()
 
         def _decode():
             try:
-                data = DecodeQR.extract_qr_data(small, is_binary=True)
+                # Attempt 1: full-res green channel
+                data = DecodeQR.extract_qr_data(full_green, is_binary=True)
                 if data is not None:
                     try:
                         self._worker_result = data.decode("utf-8").strip()
                     except Exception:
                         self._worker_result = data.decode("latin-1").strip()
+                    return
+
+                # Attempt 2: contrast-stretch the same image.
+                # Phone screens expose the camera to a bright white field; auto-exposure
+                # may compress the dynamic range so QR modules land in a narrow grey band
+                # rather than full black-to-white. Stretching to the full 0-255 range
+                # gives pyzbar sharper module edges.
+                mn = int(full_green.min())
+                mx = int(full_green.max())
+                if mx > mn:
+                    stretched = ((full_green.astype('float32') - mn) * (255.0 / (mx - mn))).astype('uint8')
+                    data = DecodeQR.extract_qr_data(stretched, is_binary=True)
+                    if data is not None:
+                        try:
+                            self._worker_result = data.decode("utf-8").strip()
+                        except Exception:
+                            self._worker_result = data.decode("latin-1").strip()
             except Exception:
                 pass
 
@@ -176,37 +219,67 @@ class _RawQRDecoder(DecodeQR):
         return self._raw_text
 
 
-class _TimeoutDecodeQR(DecodeQR):
-    """DecodeQR with SIGALRM watchdog and frame-rate limiting.
+class _ThreadedDecodeQR(DecodeQR):
+    """
+    Seed QR decoder that runs pyzbar in a daemon thread — same pattern as
+    _RawQRDecoder.
 
-    Skips 2 of every 3 frames and downsamples 2x before passing to pyzbar,
-    keeping ZBar calls to ~1 fps and reducing pixels 4x — same mitigations as
-    _RawQRDecoder.  Without this, every frame at 6 fps goes to ZBar, which
-    blocks the main thread long enough to freeze the UI on Pi Zero.
+    Why a thread rather than the main loop:
+    - pyzbar (ctypes call into libzbar) may hold the GIL for 200ms–2s on a
+      complex/blurry frame; in the main thread that freezes the display.
+      Moving it to a daemon thread gives the OS scheduler a chance to run
+      LivePreviewThread between frames.
+    - Only extract_qr_data() runs in the thread (pure pyzbar, no state
+      mutation). add_data() is called back in the main thread once the thread
+      completes — no concurrent writes to DecodeQR's internal state.
+    - Green channel only (2x spatial downsample → 240×240×1): 12x less pixel
+      data than the original 480×480 RGB, matching _RawQRDecoder. libzbar is
+      just as effective on grayscale for QR codes.
+
+    One thread at a time; every 3rd frame.
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._frame_count = 0
+        self._worker = None
+        self._worker_result = None  # raw bytes from pyzbar, written by thread
 
     def add_image(self, image):
         self._frame_count += 1
+
+        # Check whether the previous worker finished
+        if self._worker is not None:
+            if not self._worker.is_alive():
+                raw = self._worker_result
+                self._worker = None
+                self._worker_result = None
+                if raw is not None:
+                    # add_data() mutates decoder state — run in main thread
+                    return self.add_data(raw)
+                # Thread finished but found nothing — fall through to retry
+            else:
+                # Still running — skip this frame
+                return DecodeQRStatus.FALSE
+
         if self._frame_count % 3 != 0:
             return DecodeQRStatus.FALSE
 
-        if image is not None:
-            image = image[::2, ::2].copy()
+        if image is None:
+            return DecodeQRStatus.FALSE
 
-        try:
-            return _sigalrm_call(
-                _DECODE_TIMEOUT,
-                lambda: DecodeQR.add_image(self, image),
-            )
-        except TimeoutError:
-            _log.warning("_TimeoutDecodeQR: pyzbar timeout, skipping frame")
-            return DecodeQRStatus.FALSE
-        except Exception:
-            return DecodeQRStatus.FALSE
+        # Green channel only: 12x less data than 480×480 RGB, same as _RawQRDecoder
+        small = image[::2, ::2, 1].copy()
+
+        def _decode():
+            try:
+                self._worker_result = DecodeQR.extract_qr_data(small, is_binary=True)
+            except Exception:
+                pass
+
+        self._worker = threading.Thread(target=_decode, daemon=True)
+        self._worker.start()
+        return DecodeQRStatus.FALSE
 
 
 def _make_key_entry_screen(label: str):
@@ -245,6 +318,10 @@ class LegacyMainMenuView(View):
     DECRYPT = ButtonOption("Decrypt Seed Phrase", FontAwesomeIconConstants.UNLOCK)
 
     def run(self) -> Destination:
+        # Entering the menu is a flow boundary: wipe any secrets left over from
+        # an abandoned (backed-out) flow.
+        _session(self).clear()
+
         button_data = [self.ENCRYPT, self.DECRYPT]
 
         selected = self.run_screen(
@@ -360,20 +437,21 @@ class LegacyEnterSeedWordView(View):
         seed_phrase = " ".join(words)
         self.controller.storage.discard_pending_mnemonic()
 
-        if not validate_seed_phrase(seed_phrase):
+        err = seed_phrase_error(seed_phrase)
+        if err is not None:
             self.run_screen(
                 WarningScreen,
                 title="Invalid Seed",
-                status_headline="Bad Checksum",
-                text="The last word doesn't match the checksum. Check all words carefully and try again.",
+                status_headline="Invalid Seed",
+                text=err + " Check all words carefully and try again.",
                 button_data=[self.OK],
             )
             return Destination(LegacyManualSeedWordCountView)
 
-        return Destination(
-            LegacyEnterBenefactorKeyView,
-            view_args={"seed_phrase": seed_phrase, "mode": "encrypt"},
-        )
+        session = _session(self)
+        session.seed_phrase = seed_phrase
+        session.mode = "encrypt"
+        return Destination(LegacyEnterBenefactorKeyView)
 
 
 # ===================================================================
@@ -384,10 +462,10 @@ class LegacyEncryptScanSeedView(View):
     OK = ButtonOption("OK")
 
     def run(self) -> Destination:
-        _log.info("LegacyEncryptScanSeedView: starting seed QR scan")
-        import gc; gc.collect()
+        from seedsigner.hardware.camera import Camera
+        Camera.get_instance().stop_for_pbkdf2()  # kill any stale parked stream before fresh open
         wordlist_lang = self.settings.get_value(SettingsConstants.SETTING__WORDLIST_LANGUAGE)
-        decoder = _TimeoutDecodeQR(wordlist_language_code=wordlist_lang)
+        decoder = _ThreadedDecodeQR(wordlist_language_code=wordlist_lang)
 
         self.run_screen(
             ScanScreen,
@@ -420,20 +498,13 @@ class LegacyEncryptScanSeedView(View):
             )
             return Destination(BackStackView)
 
-        return Destination(
-            LegacyEnterBenefactorKeyView,
-            view_args={"seed_phrase": seed_phrase, "mode": "encrypt"},
-        )
+        session = _session(self)
+        session.seed_phrase = seed_phrase
+        session.mode = "encrypt"
+        return Destination(LegacyEnterBenefactorKeyView)
 
 
 class LegacyEnterBenefactorKeyView(View):
-    def __init__(self, seed_phrase: str = "", mode: str = "encrypt",
-                 encrypted_data: str = ""):
-        super().__init__()
-        self.seed_phrase = seed_phrase
-        self.mode = mode
-        self.encrypted_data = encrypted_data
-
     def run(self) -> Destination:
         ret = self.run_screen(_make_key_entry_screen("Benefactor Key"))
 
@@ -442,26 +513,11 @@ class LegacyEnterBenefactorKeyView(View):
 
         key = ret["passphrase"] if isinstance(ret, dict) else ret
 
-        return Destination(
-            LegacyEnterBeneficiaryKeyView,
-            view_args={
-                "seed_phrase": self.seed_phrase,
-                "mode": self.mode,
-                "encrypted_data": self.encrypted_data,
-                "benefactor_key": key,
-            },
-        )
+        _session(self).benefactor_key = key
+        return Destination(LegacyEnterBeneficiaryKeyView)
 
 
 class LegacyEnterBeneficiaryKeyView(View):
-    def __init__(self, seed_phrase: str = "", mode: str = "encrypt",
-                 encrypted_data: str = "", benefactor_key: str = ""):
-        super().__init__()
-        self.seed_phrase = seed_phrase
-        self.mode = mode
-        self.encrypted_data = encrypted_data
-        self.benefactor_key = benefactor_key
-
     def run(self) -> Destination:
         ret = self.run_screen(_make_key_entry_screen("Beneficiary Key"))
 
@@ -470,38 +526,21 @@ class LegacyEnterBeneficiaryKeyView(View):
 
         key = ret["passphrase"] if isinstance(ret, dict) else ret
 
-        if self.mode == "encrypt":
-            return Destination(
-                LegacyConfirmEncryptView,
-                view_args={
-                    "seed_phrase": self.seed_phrase,
-                    "benefactor_key": self.benefactor_key,
-                    "beneficiary_key": key,
-                },
-            )
+        session = _session(self)
+        session.beneficiary_key = key
+
+        if session.mode == "encrypt":
+            return Destination(LegacyConfirmEncryptView)
         else:
-            return Destination(
-                LegacyDecryptingView,
-                view_args={
-                    "encrypted_data": self.encrypted_data,
-                    "benefactor_key": self.benefactor_key,
-                    "beneficiary_key": key,
-                },
-            )
+            return Destination(LegacyDecryptingView)
 
 
 class LegacyConfirmEncryptView(View):
     CANCEL = ButtonOption("Cancel")
 
-    def __init__(self, seed_phrase: str = "", benefactor_key: str = "",
-                 beneficiary_key: str = ""):
-        super().__init__()
-        self.seed_phrase = seed_phrase
-        self.benefactor_key = benefactor_key
-        self.beneficiary_key = beneficiary_key
-
     def run(self) -> Destination:
-        word_count = len(self.seed_phrase.split())
+        session = _session(self)
+        word_count = len(session.seed_phrase.split())
         confirm = ButtonOption(f"Encrypt {word_count}-word seed")
         button_data = [confirm, self.CANCEL]
 
@@ -515,85 +554,76 @@ class LegacyConfirmEncryptView(View):
         if selected == RET_CODE__BACK_BUTTON or button_data[selected] == self.CANCEL:
             return Destination(BackStackView)
 
-        return Destination(
-            LegacyEncryptingView,
-            view_args={
-                "seed_phrase": self.seed_phrase,
-                "benefactor_key": self.benefactor_key,
-                "beneficiary_key": self.beneficiary_key,
-            },
-        )
+        return Destination(LegacyEncryptingView)
 
 
 class LegacyEncryptingView(View):
     OK = ButtonOption("OK")
 
-    def __init__(self, seed_phrase: str = "", benefactor_key: str = "",
-                 beneficiary_key: str = ""):
-        super().__init__()
-        self.seed_phrase = seed_phrase
-        self.benefactor_key = benefactor_key
-        self.beneficiary_key = beneficiary_key
-
     def run(self) -> Destination:
-        _log.info("LegacyEncryptingView: begin encrypt")
         from seedsigner.hardware.camera import Camera
-        Camera.get_instance().stop_video_stream_mode()
+
+        session = _session(self)
 
         _sync_loading_frame("Encrypting...  (15-30 sec)")
-        loading = LoadingScreenThread(text="Encrypting...  (15-30 sec)")
-        loading.start()
+        Camera.get_instance().stop_for_pbkdf2()  # fully kill camera DMA before PBKDF2
 
-        error = None
-        try:
-            _log.info("LegacyEncryptingView: PBKDF2 start")
-            encrypted = encrypt_seed_phrase(
-                self.seed_phrase,
-                self.benefactor_key,
-                self.beneficiary_key,
-            )
-            _log.info("LegacyEncryptingView: PBKDF2 done")
-        except Exception as e:
-            error = e
-        finally:
-            loading.stop()
-            _log.info("LegacyEncryptingView: loading screen stopped")
+        # PBKDF2 runs in a background thread; main thread does 1fps display updates.
+        result_box = [None]
+        error_box = [None]
+        done = threading.Event()
 
-        if error is not None:
+        def _do_encrypt():
+            try:
+                result_box[0] = encrypt_seed_phrase(
+                    session.seed_phrase,
+                    session.benefactor_key,
+                    session.beneficiary_key,
+                )
+            except Exception as e:
+                error_box[0] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=_do_encrypt, daemon=True).start()
+
+        elapsed = 0
+        while not done.wait(timeout=1.0):
+            elapsed += 1
+            _sync_loading_frame(f"Encrypting...  {elapsed}s")
+
+        if error_box[0] is not None:
             self.run_screen(
                 WarningScreen,
                 title="Encryption Failed",
                 status_headline="Error",
-                text=str(error),
+                text=str(error_box[0]),
                 button_data=[self.OK],
             )
+            # Keep the session so the user can go back and retry with the same input.
             return Destination(BackStackView)
 
-        import gc
+        # Encryption succeeded: the plaintext seed and both keys are no longer
+        # needed. Drop them now rather than waiting for the terminal screen.
+        session.encrypted_data = result_box[0]
+        session.seed_phrase = None
+        session.benefactor_key = None
+        session.beneficiary_key = None
         gc.collect()
 
-        return Destination(
-            LegacyShowEncryptedQRView,
-            view_args={"encrypted": encrypted},
-        )
+        return Destination(LegacyShowEncryptedQRView)
 
 
 class LegacyShowEncryptedQRView(View):
     READY = ButtonOption("Show QR Code")
     SAVED = ButtonOption("I've saved it")
 
-    def __init__(self, encrypted: str = ""):
-        super().__init__()
-        self.encrypted = encrypted
-
     def run(self) -> Destination:
-        _log.info("LegacyShowEncryptedQRView: run start")
-        qr_data = encrypted_to_qr_data(self.encrypted)
+        session = _session(self)
+        qr_data = encrypted_to_qr_data(session.encrypted_data)
         qr_encoder = GenericStaticQrEncoder(data=qr_data)
-        _log.info("LegacyShowEncryptedQRView: QR encoder created")
 
         # Warn before showing QR so user has camera ready
-        _log.info("LegacyShowEncryptedQRView: showing Get Camera Ready screen")
         self.run_screen(
             LargeIconStatusScreen,
             title="Get Camera Ready",
@@ -601,13 +631,10 @@ class LegacyShowEncryptedQRView(View):
             text="Get ready to photograph the encrypted QR. You cannot recover your seed without it and BOTH keys.",
             button_data=[self.READY],
         )
-        _log.info("LegacyShowEncryptedQRView: Get Camera Ready dismissed")
 
         # Loop: back from confirmation returns to QR so they can re-photograph
         while True:
-            _log.info("LegacyShowEncryptedQRView: showing QR display screen")
             self.run_screen(QRDisplayScreen, qr_encoder=qr_encoder)
-            _log.info("LegacyShowEncryptedQRView: QR dismissed, showing saved confirmation")
             ret = self.run_screen(
                 LargeIconStatusScreen,
                 title="Saved?",
@@ -618,7 +645,7 @@ class LegacyShowEncryptedQRView(View):
             if ret != RET_CODE__BACK_BUTTON:
                 break
 
-        _log.info("LegacyShowEncryptedQRView: done")
+        session.clear()
         return Destination(LegacyMainMenuView, clear_history=True)
 
 
@@ -630,8 +657,8 @@ class LegacyDecryptScanQRView(View):
     OK = ButtonOption("OK")
 
     def run(self) -> Destination:
-        _log.info("LegacyDecryptScanQRView: starting encrypted QR scan")
-        import gc; gc.collect()
+        from seedsigner.hardware.camera import Camera
+        Camera.get_instance().stop_for_pbkdf2()  # kill any stale parked stream before fresh open
         decoder = _RawQRDecoder()
 
         # Use default resolution (480×480) and framerate (6) — the same settings
@@ -684,53 +711,48 @@ class LegacyDecryptScanQRView(View):
             )
             return Destination(BackStackView)
 
-        return Destination(
-            LegacyEnterBenefactorKeyView,
-            view_args={
-                "seed_phrase": "",
-                "mode": "decrypt",
-                "encrypted_data": encrypted_data,
-            },
-        )
+        session = _session(self)
+        session.encrypted_data = encrypted_data
+        session.mode = "decrypt"
+        return Destination(LegacyEnterBenefactorKeyView)
 
 
 class LegacyDecryptingView(View):
     OK = ButtonOption("OK")
 
-    def __init__(self, encrypted_data: str = "", benefactor_key: str = "",
-                 beneficiary_key: str = ""):
-        super().__init__()
-        self.encrypted_data = encrypted_data
-        self.benefactor_key = benefactor_key
-        self.beneficiary_key = beneficiary_key
-
     def run(self) -> Destination:
-        _log.info("LegacyDecryptingView: begin decrypt")
         from seedsigner.hardware.camera import Camera
-        Camera.get_instance().stop_video_stream_mode()
+
+        session = _session(self)
 
         _sync_loading_frame("Decrypting...  (15-30 sec)")
-        loading = LoadingScreenThread(text="Decrypting...  (15-30 sec)")
-        loading.start()
-        time.sleep(0.1)  # let LoadingScreenThread render its first frame before PBKDF2 grabs CPU
+        Camera.get_instance().stop_for_pbkdf2()  # fully kill camera DMA before PBKDF2
 
-        error = None
-        try:
-            _log.info("LegacyDecryptingView: PBKDF2 start")
-            seed_phrase = decrypt_seed_phrase(
-                self.encrypted_data,
-                self.benefactor_key,
-                self.beneficiary_key,
-            )
-            _log.info("LegacyDecryptingView: PBKDF2 done")
-        except Exception as e:
-            error = e
-        finally:
-            loading.stop()
-            _log.info("LegacyDecryptingView: loading screen stopped")
+        result_box = [None]
+        error_box = [None]
+        done = threading.Event()
 
-        if error is not None:
-            msg = str(error)
+        def _do_decrypt():
+            try:
+                result_box[0] = decrypt_seed_phrase(
+                    session.encrypted_data,
+                    session.benefactor_key,
+                    session.beneficiary_key,
+                )
+            except Exception as e:
+                error_box[0] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=_do_decrypt, daemon=True).start()
+
+        elapsed = 0
+        while not done.wait(timeout=1.0):
+            elapsed += 1
+            _sync_loading_frame(f"Decrypting...  {elapsed}s")
+
+        if error_box[0] is not None:
+            msg = str(error_box[0])
             if any(k in msg.lower() for k in ("tag", "authentication", "invalid")):
                 msg = "Decryption failed. Check that both keys are correct — spelling, capitalization, and spaces all matter."
             self.run_screen(
@@ -740,9 +762,10 @@ class LegacyDecryptingView(View):
                 text=msg,
                 button_data=[self.OK],
             )
+            # Keep the session so the user can go back and retry the keys.
             return Destination(BackStackView)
 
-        if not validate_seed_phrase(seed_phrase):
+        if not validate_seed_phrase(result_box[0]):
             self.run_screen(
                 WarningScreen,
                 title="Bad Result",
@@ -752,28 +775,27 @@ class LegacyDecryptingView(View):
             )
             return Destination(BackStackView)
 
-        import gc
+        # Decryption succeeded: keys and ciphertext are no longer needed.
+        session.seed_phrase = result_box[0]
+        session.benefactor_key = None
+        session.beneficiary_key = None
+        session.encrypted_data = None
         gc.collect()
 
-        return Destination(
-            LegacyShowDecryptedSeedView,
-            view_args={"seed_phrase": seed_phrase},
-        )
+        return Destination(LegacyShowDecryptedSeedView)
 
 
 class LegacyShowDecryptedSeedView(View):
+    LOAD       = ButtonOption("Load into SeedSigner")
     SHOW_WORDS = ButtonOption("Read Seed Words")
     EXPORT_QR  = ButtonOption("Export as SeedQR")
     DONE       = ButtonOption("Done  (clears memory)")
 
-    def __init__(self, seed_phrase: str = ""):
-        super().__init__()
-        self.seed_phrase = seed_phrase
-
     def run(self) -> Destination:
-        _log.info("LegacyShowDecryptedSeedView: run start")
-        word_count = len(self.seed_phrase.split())
-        button_data = [self.SHOW_WORDS, self.EXPORT_QR, self.DONE]
+        session = _session(self)
+        seed_phrase = session.seed_phrase
+        word_count = len(seed_phrase.split())
+        button_data = [self.LOAD, self.SHOW_WORDS, self.EXPORT_QR, self.DONE]
 
         selected = self.run_screen(
             ButtonListScreen,
@@ -782,26 +804,35 @@ class LegacyShowDecryptedSeedView(View):
             is_button_text_centered=True,
             show_back_button=False,
         )
-        _log.info("LegacyShowDecryptedSeedView: button pressed index=%s", selected)
 
         if selected == RET_CODE__BACK_BUTTON:
             # Physical back button still fires even with show_back_button=False.
             # Loop back to the same screen — user must press Done to exit.
-            return Destination(LegacyShowDecryptedSeedView, view_args={"seed_phrase": self.seed_phrase})
+            return Destination(LegacyShowDecryptedSeedView)
+
+        if button_data[selected] == self.LOAD:
+            from seedsigner.models.seed import Seed
+            from seedsigner.views.seed_views import SeedFinalizeView
+            words = seed_phrase.split()
+            self.controller.storage.set_pending_seed(Seed(mnemonic=words))
+            # Seed is now owned by SeedSigner storage — drop our copy.
+            session.clear()
+            return Destination(SeedFinalizeView, clear_history=True)
 
         if button_data[selected] == self.SHOW_WORDS:
             return Destination(
                 LegacyShowSeedWordsView,
-                view_args={"seed_phrase": self.seed_phrase, "page_index": 0},
+                view_args={"page_index": 0},
             )
 
         if button_data[selected] == self.EXPORT_QR:
             from seedsigner.models.encode_qr import SeedQrEncoder
-            qr_encoder = SeedQrEncoder(mnemonic=self.seed_phrase.split())
+            qr_encoder = SeedQrEncoder(mnemonic=seed_phrase.split())
             self.run_screen(QRDisplayScreen, qr_encoder=qr_encoder)
-            return Destination(LegacyShowDecryptedSeedView, view_args={"seed_phrase": self.seed_phrase})
+            return Destination(LegacyShowDecryptedSeedView)
 
-        self.seed_phrase = ""
+        # DONE
+        session.clear()
         return Destination(LegacyMainMenuView, clear_history=True)
 
 
@@ -809,16 +840,14 @@ class LegacyShowSeedWordsView(View):
     NEXT = ButtonOption("Next")
     DONE = ButtonOption("Done")
 
-    def __init__(self, seed_phrase: str = "", page_index: int = 0):
+    def __init__(self, page_index: int = 0):
         super().__init__()
-        self.seed_phrase = seed_phrase
         self.page_index = page_index
 
     def run(self) -> Destination:
-        _log.info("LegacyShowSeedWordsView: run start page=%s", self.page_index)
         from seedsigner.gui.screens.seed_screens import SeedWordsScreen
 
-        words = self.seed_phrase.split()
+        words = _session(self).seed_phrase.split()
         words_per_page = 4
         num_pages = (len(words) + words_per_page - 1) // words_per_page
         page_words = words[self.page_index * words_per_page:(self.page_index + 1) * words_per_page]
@@ -839,7 +868,7 @@ class LegacyShowSeedWordsView(View):
         if button_data[selected] == self.NEXT:
             return Destination(
                 LegacyShowSeedWordsView,
-                view_args={"seed_phrase": self.seed_phrase, "page_index": self.page_index + 1},
+                view_args={"page_index": self.page_index + 1},
             )
 
-        return Destination(LegacyShowDecryptedSeedView, view_args={"seed_phrase": self.seed_phrase})
+        return Destination(LegacyShowDecryptedSeedView)

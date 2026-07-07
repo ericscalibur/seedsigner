@@ -305,6 +305,8 @@ class Controller(Singleton):
                     self.psbt_parser = None
                     self.psbt_seed = None
                 
+                    # Legacy Encryption: wipe in-progress seed/keys on Home
+                    self.legacy_session = None
                 logger.info(f"\nback_stack: {self.back_stack}")
 
                 try:

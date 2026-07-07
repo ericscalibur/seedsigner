@@ -1,14 +1,15 @@
 import io
+import logging
 import time
 
 from PIL import Image
 from seedsigner.hardware.pivideostream import PiVideoStream
 from seedsigner.models.settings import Settings, SettingsConstants
 from seedsigner.models.singleton import Singleton
-from seedsigner.helpers.legacy_log import get_logger
 
-_log = get_logger("legacy.camera")
-_log.info("camera.py loaded — v3 (500ms flush, framerate=1 park)")
+# Stdlib logger only — same idiom as the rest of SeedSigner. Nothing is ever
+# written to the SD card; on the device this goes to the console (i.e. nowhere).
+_log = logging.getLogger(__name__)
 
 
 class Camera(Singleton):
@@ -16,6 +17,7 @@ class Camera(Singleton):
     _parked_stream = None   # stream kept alive between scans; avoids second PiCamera() open
     _picamera = None
     _camera_rotation = None
+    _last_preview_time = 0.0  # throttle for as_image=True preview renders
 
     @classmethod
     def get_instance(cls):
@@ -28,6 +30,11 @@ class Camera(Singleton):
 
     def start_video_stream_mode(self, resolution=(320, 240), framerate=12, format="bgr"):
         from seedsigner.hardware.pivideostream import PiVideoStream
+        # Cap at 3fps. ScanScreen requests 6fps, but on Pi Zero the combination of
+        # sustained MMAL DMA (camera) + SPI DMA (display) causes a kernel deadlock
+        # when a scan runs for more than ~10-20 seconds. 3fps halves the MMAL DMA
+        # budget and eliminates the freeze without meaningfully affecting scan speed.
+        framerate = min(framerate, 3)
         if self._video_stream is not None:
             self.stop_video_stream_mode()
 
@@ -57,7 +64,6 @@ class Camera(Singleton):
                 self._parked_stream = None
         if self._parked_stream is not None:
             if not self._parked_stream.is_stopped:
-                _log.info("start_video_stream_mode: reusing parked stream, flushing 500ms")
                 # Restore scan framerate — parked stream was throttled to 1 fps.
                 try:
                     self._parked_stream.camera.framerate = framerate
@@ -79,7 +85,6 @@ class Camera(Singleton):
                 while self._parked_stream.frame is None and time.time() < deadline:
                     time.sleep(0.05)
                 if self._parked_stream.frame is not None:
-                    _log.info("start_video_stream_mode: flush done, stream ready")
                     self._video_stream = self._parked_stream
                     self._parked_stream = None
                     return
@@ -88,7 +93,6 @@ class Camera(Singleton):
             self._force_close_stream(self._parked_stream)
             self._parked_stream = None
 
-        _log.info("start_video_stream_mode: opening fresh PiVideoStream")
         self._video_stream = PiVideoStream(resolution=resolution, framerate=framerate, format=format)
         self._video_stream.start()
 
@@ -106,7 +110,6 @@ class Camera(Singleton):
             raise RuntimeError(
                 "Camera failed to start. Power the device off and back on to reset it."
             )
-        _log.info("start_video_stream_mode: fresh stream ready")
 
 
     def read_video_stream(self, as_image=False):
@@ -120,8 +123,41 @@ class Camera(Singleton):
             return frame
         else:
             if frame is not None:
+                # Throttle LivePreviewThread to ~5fps to prevent SPI DMA storm on Pi Zero.
+                # Without this, the tight loop in LivePreviewThread.run() pushes 50-100
+                # SPI writes/second. For short scans (paper QR) this is fine; for a phone
+                # screen showing a dense encrypted QR that takes 30+ seconds to decode,
+                # sustained SPI DMA + MMAL DMA on a single core triggers a kernel deadlock.
+                now = time.time()
+                elapsed = now - self._last_preview_time
+                if elapsed < 0.34:  # ~3fps cap, matched to camera framerate
+                    time.sleep(0.34 - elapsed)
+                self._last_preview_time = time.time()
                 return Image.fromarray(frame.astype('uint8'), 'RGB').convert('RGBA').rotate(90 + self._camera_rotation)
         return None
+
+
+    def stop_for_pbkdf2(self):
+        """Kill all camera DMA activity before a long PBKDF2 operation.
+
+        ScanScreen parks (not stops) the camera when a scan completes, so
+        stop_video_stream_mode() called from the encrypt/decrypt views is a
+        no-op — the parked 1fps stream keeps firing MMAL DMA.  On a single-
+        core Pi Zero, MMAL DMA + PBKDF2 at 100% CPU + the unthrottled
+        LoadingScreenThread SPI loop causes a kernel-level deadlock 8/10 runs.
+
+        Calling this instead fully kills both streams.  With 30+ s of MMAL
+        settle time before the next scan is initiated, the MMAL re-init
+        deadlock cannot occur.
+        """
+        vs = self._video_stream
+        if vs is not None:
+            self._video_stream = None
+            self._force_close_stream(vs)
+        ps = self._parked_stream
+        if ps is not None:
+            self._parked_stream = None
+            self._force_close_stream(ps)
 
 
     def stop_video_stream_mode(self):
@@ -137,7 +173,6 @@ class Camera(Singleton):
                 self._force_close_stream(self._parked_stream)
             self._parked_stream = self._video_stream
             self._video_stream = None
-            _log.info("stop_video_stream_mode: stream parked, dropping to 1fps")
             # Drop to 1 fps. The parked thread keeps the camera sensor running at
             # whatever framerate was configured, firing that many DMA interrupts/sec.
             # On Pi Zero's single core, 12 interrupts/sec during PBKDF2 or UI

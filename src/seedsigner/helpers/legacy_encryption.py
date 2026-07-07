@@ -10,6 +10,7 @@ Install:      pip install cryptography
 """
 
 import os
+import re
 import base64
 import hashlib
 import secrets
@@ -35,7 +36,15 @@ def _load_wordlist() -> list[str]:
     if _BIP39_WORDLIST is not None:
         return _BIP39_WORDLIST
 
-    # Try SeedSigner's bundled wordlist location first
+    # Try embit first — that's how SeedSigner itself carries the wordlist
+    try:
+        from embit.bip39 import WORDLIST
+        _BIP39_WORDLIST = list(WORDLIST)
+        return _BIP39_WORDLIST
+    except Exception:
+        pass
+
+    # Fall back to english.txt file (useful for local dev / testing)
     search_paths = [
         os.path.join(os.path.dirname(__file__), "english.txt"),
         os.path.join(os.path.dirname(__file__), "..", "seedsigner", "resources", "english.txt"),
@@ -52,8 +61,8 @@ def _load_wordlist() -> list[str]:
             continue
 
     raise FileNotFoundError(
-        "BIP-39 english.txt not found. Place it next to this module or "
-        "ensure SeedSigner's wordlist is accessible."
+        "BIP-39 wordlist not found. Ensure embit is installed or place english.txt "
+        "next to this module."
     )
 
 
@@ -72,13 +81,17 @@ KEY_BITS = 256
 KEY_BYTES = KEY_BITS // 8
 
 
-def derive_key(password: str, salt: bytes) -> bytes:
-    """PBKDF2-SHA256 key derivation — mirrors deriveKey() in the JS."""
+def derive_key(password: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS) -> bytes:
+    """PBKDF2-SHA256 key derivation — mirrors deriveKey() in the JS.
+
+    ``iterations`` defaults to the canonical 600 000 but is a parameter so the
+    v2 envelope can carry (and a future build can bump) the count.
+    """
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=KEY_BYTES,
         salt=salt,
-        iterations=PBKDF2_ITERATIONS,
+        iterations=iterations,
     )
     return kdf.derive(password.encode("utf-8"))
 
@@ -142,13 +155,74 @@ def decrypt_data(data: dict, password: str) -> str:
 # Seed-phrase–level functions (dual-key wrapper)
 # ---------------------------------------------------------------------------
 
-def validate_seed_phrase(seed_phrase: str) -> bool:
-    """Check that a seed phrase is 12 or 24 valid BIP-39 words."""
+def seed_phrase_error(seed_phrase: str) -> str | None:
+    """Validate a BIP-39 mnemonic, including the checksum.
+
+    Returns ``None`` when the phrase is fully valid, otherwise a short
+    human-readable reason — so the UI can show an *accurate* message instead
+    of always claiming "Bad Checksum".
+    """
     words = seed_phrase.split(" ")
     if len(words) not in (12, 24):
-        return False
+        return "Seed phrase must be 12 or 24 words."
+
     wordlist = get_wordlist()
-    return all(w in wordlist for w in words)
+    indices: list[int] = []
+    for w in words:
+        try:
+            indices.append(wordlist.index(w))
+        except ValueError:
+            return "Contains a word that isn't in the BIP-39 list."
+
+    # Concatenate the 11-bit word indices, then split into entropy + checksum.
+    bits = "".join(format(i, "011b") for i in indices)
+    total_bits = len(words) * 11           # 132 (12 words) or 264 (24 words)
+    checksum_bits = total_bits // 33       # 4 or 8  (CS = ENT/32)
+    entropy_bits = total_bits - checksum_bits
+    entropy = int(bits[:entropy_bits], 2).to_bytes(entropy_bits // 8, "big")
+    digest_bits = "".join(format(b, "08b") for b in hashlib.sha256(entropy).digest())
+    if digest_bits[:checksum_bits] != bits[entropy_bits:]:
+        return "The last word doesn't match the BIP-39 checksum."
+
+    return None
+
+
+def validate_seed_phrase(seed_phrase: str) -> bool:
+    """True iff the phrase is a valid BIP-39 mnemonic (checksum included)."""
+    return seed_phrase_error(seed_phrase) is None
+
+
+# ---------------------------------------------------------------------------
+# Protocol v2 envelope (see PROTOCOL-V2-SPEC.md)
+#   "LE2." + base64url( header(35) || ciphertext )
+#   header = version(1) kdf_id(1) iterations(4,BE) padLen(1) salt(16) iv(12)
+# ---------------------------------------------------------------------------
+
+V2_PREFIX = "LE2."
+V2_VERSION = 0x02
+KDF_PBKDF2_SHA256 = 0x01
+V2_HEADER_LEN = 35
+# Bounds on the header's iteration count. The header is only authenticated
+# AFTER key derivation, so without a cap a forged payload could set
+# iterations=0xFFFFFFFF and stall the device for days before the GCM tag
+# ever gets checked.
+MIN_PBKDF2_ITERATIONS = 100_000
+MAX_PBKDF2_ITERATIONS = 10_000_000
+# Unit Separator (0x1F) — untypeable, so the benefactor/beneficiary boundary is
+# unambiguous: "ab"+"c" no longer derives the same key as "a"+"bc".
+KEY_SEPARATOR = "\x1f"
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _combined_key_v2(benefactor_key: str, beneficiary_key: str) -> str:
+    return benefactor_key + KEY_SEPARATOR + beneficiary_key
 
 
 def encrypt_seed_phrase(
@@ -156,25 +230,39 @@ def encrypt_seed_phrase(
     benefactor_key: str,
     beneficiary_key: str,
 ) -> str:
-    """Encrypt a BIP-39 seed phrase with the dual-key scheme.
+    """Encrypt a BIP-39 seed phrase with the dual-key scheme (Protocol v2).
 
-    Returns a base64 string (trailing '=' stripped) that is fully
-    compatible with Legacy-offline.html's decryptSeedPhrase().
+    Returns an ``LE2.`` payload that Legacy-offline.html's decryptSeedPhrase()
+    can read. Decryption requires both keys in the same order.
     """
-    if not validate_seed_phrase(seed_phrase):
-        raise ValueError("Invalid seed phrase")
+    err = seed_phrase_error(seed_phrase)
+    if err is not None:
+        raise ValueError(err)
 
-    combined_key = benefactor_key + beneficiary_key
-    enc = encrypt_data(seed_phrase, combined_key)
+    salt = os.urandom(SALT_BYTES)
+    iv = os.urandom(IV_BYTES)
+    pad_len = secrets.randbelow(5)  # 0..4
+    iterations = PBKDF2_ITERATIONS
 
-    padding_str = str(enc["paddingLength"]).zfill(2)
-    combined = f'{enc["salt"]}.{enc["iv"]}.{enc["ciphertext"]}.{padding_str}'
+    header = (
+        bytes([V2_VERSION, KDF_PBKDF2_SHA256])
+        + iterations.to_bytes(4, "big")
+        + bytes([pad_len])
+        + salt
+        + iv
+    )
+    assert len(header) == V2_HEADER_LEN
 
-    # Outer base64 encode, strip trailing '='
-    encoded = base64.b64encode(combined.encode("utf-8")).decode("ascii")
-    encoded = encoded.rstrip("=")
+    # Pad on the BYTE array (not the string) so high bytes can't desync padLen.
+    plaintext = seed_phrase.encode("utf-8") + bytes(
+        secrets.randbelow(256) for _ in range(pad_len)
+    )
 
-    return encoded
+    key = derive_key(_combined_key_v2(benefactor_key, beneficiary_key), salt, iterations)
+    # Header is bound as GCM AAD, so tampering with version/params fails the tag.
+    ciphertext = AESGCM(key).encrypt(iv, plaintext, header)
+
+    return V2_PREFIX + _b64url_encode(header + ciphertext)
 
 
 def decrypt_seed_phrase(
@@ -182,26 +270,55 @@ def decrypt_seed_phrase(
     benefactor_key: str,
     beneficiary_key: str,
 ) -> str:
-    """Decrypt an encrypted seed phrase produced by encrypt_seed_phrase()
-    or by Legacy-offline.html's encryptSeedPhrase().
+    """Decrypt a Legacy payload. Dispatches on version: ``LE2.`` -> v2,
+    no marker -> legacy v1 (kept forever for backward compatibility).
     """
+    payload = encrypted_seed_phrase.strip()
+    m = re.match(r"^LE(\d+)\.", payload)
+    if m:
+        body = _b64url_decode(payload[len(m.group(0)):])
+        version = body[0] if body else None
+        if version == V2_VERSION:
+            return _decrypt_v2(body, benefactor_key, beneficiary_key)
+        raise ValueError(f"Unsupported Legacy Encryption version: {version!r}")
+    return _decrypt_v1(payload, benefactor_key, beneficiary_key)
+
+
+def _decrypt_v2(body: bytes, benefactor_key: str, beneficiary_key: str) -> str:
+    if len(body) < V2_HEADER_LEN:
+        raise ValueError("Truncated v2 payload.")
+    kdf_id = body[1]
+    if kdf_id != KDF_PBKDF2_SHA256:
+        raise ValueError(f"Unsupported KDF id: 0x{kdf_id:02x}")
+    iterations = int.from_bytes(body[2:6], "big")
+    if not (MIN_PBKDF2_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS):
+        raise ValueError(f"Unreasonable PBKDF2 iteration count: {iterations}")
+    pad_len = body[6]
+    salt = body[7:23]
+    iv = body[23:35]
+    header = body[:V2_HEADER_LEN]
+    ciphertext = body[V2_HEADER_LEN:]
+
+    key = derive_key(_combined_key_v2(benefactor_key, beneficiary_key), salt, iterations)
+    plaintext = AESGCM(key).decrypt(iv, ciphertext, header)
+    if pad_len:
+        plaintext = plaintext[:-pad_len]
+    return plaintext.decode("utf-8")
+
+
+def _decrypt_v1(payload: str, benefactor_key: str, beneficiary_key: str) -> str:
+    # v1: keys concatenated with NO separator (the historical format).
     combined_key = benefactor_key + beneficiary_key
-
-    # Re-pad base64 if needed and decode
-    padded = encrypted_seed_phrase + "=" * (-len(encrypted_seed_phrase) % 4)
-    decoded = base64.b64decode(padded).decode("utf-8")
-
+    decoded = base64.b64decode(payload + "=" * (-len(payload) % 4)).decode("utf-8")
     parts = decoded.split(".")
     if len(parts) != 4:
         raise ValueError("Invalid encrypted seed phrase format.")
-
     data = {
         "salt": parts[0],
         "iv": parts[1],
         "ciphertext": parts[2],
         "paddingLength": int(parts[3]),
     }
-
     return decrypt_data(data, combined_key)
 
 
@@ -236,7 +353,8 @@ if __name__ == "__main__":
         "abstract", "absurd", "abuse", "access", "accident",
     ]
 
-    seed = "abandon ability able about above absent absorb abstract absurd abuse access accident"
+    # Canonical all-zero-entropy mnemonic (checksum word = "about") — valid BIP-39.
+    seed = "abandon " * 11 + "about"
     bk = "benefactor-password-123"
     byk = "beneficiary-password-456"
 
