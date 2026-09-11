@@ -9,7 +9,6 @@ from seedsigner.gui.screens.screen import BaseScreen, ButtonOption, LargeButtonS
 from seedsigner.models.settings import Settings, SettingsConstants
 from seedsigner.models.settings_definition import SettingsDefinition
 from seedsigner.models.threads import BaseThread
-from seedsigner.views.legacy_views import LegacyMainMenuView
 
 
 class BackStackView:
@@ -189,11 +188,10 @@ class MainMenuView(View):
     SEEDS = ButtonOption("Seeds", SeedSignerIconConstants.SEEDS)
     TOOLS = ButtonOption("Tools", SeedSignerIconConstants.TOOLS)
     SETTINGS = ButtonOption("Settings", SeedSignerIconConstants.SETTINGS)
-    LEGACY = ButtonOption("Legacy Encryption", FontAwesomeIconConstants.LOCK)
 
     def run(self):
         from seedsigner.gui.screens.screen import MainMenuScreen
-        button_data = [self.SCAN, self.SEEDS, self.TOOLS, self.SETTINGS, self.LEGACY]
+        button_data = [self.SCAN, self.SEEDS, self.TOOLS, self.SETTINGS]
         selected_menu_num = self.run_screen(
             MainMenuScreen,
             title=_("Home"),
@@ -219,8 +217,6 @@ class MainMenuView(View):
             from seedsigner.views.settings_views import SettingsMenuView
             return Destination(SettingsMenuView)
 
-        elif button_data[selected_menu_num] == self.LEGACY:
-            return Destination(LegacyMainMenuView)
 
 
 
