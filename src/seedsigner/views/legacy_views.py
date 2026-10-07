@@ -5,13 +5,14 @@ Flow:
   MainMenu → LegacyMainMenuView
     ├── Encrypt: LegacyEncryptInputMethodView
     │    ├── Scan Seed QR → LegacyEncryptScanSeedView
-    │    │                → EnterBenefactorKey → EnterBeneficiaryKey
+    │    │                → EnterKey(benefactor) → EnterKey(benefactor, confirm)
+    │    │                → EnterKey(beneficiary) → EnterKey(beneficiary, confirm)
     │    │                → ConfirmEncrypt → EncryptingView → ShowEncryptedQRView
     │    └── Enter Manually → LegacyManualSeedWordCountView
     │                       → LegacyEnterSeedWordView (×12 or ×24)
-    │                       → EnterBenefactorKey → EnterBeneficiaryKey
-    │                       → ConfirmEncrypt → EncryptingView → ShowEncryptedQRView
-    └── Decrypt: ScanEncryptedQR → EnterBenefactorKey → EnterBeneficiaryKey
+    │                       → (same four key entries) → ConfirmEncrypt
+    │                       → EncryptingView → ShowEncryptedQRView
+    └── Decrypt: ScanEncryptedQR → EnterKey(benefactor) → EnterKey(beneficiary)
                  → DecryptingView → ShowDecryptedSeedView → ShowSeedWordsView
 
 Secret handling
@@ -25,11 +26,16 @@ navigation state. The session is cleared at every flow boundary (menu entry,
 successful completion, and after the seed is handed off to SeedSigner storage),
 and the controller's home-wipe also drops it on a power/home exit (see
 ``patch_controller.py``). view_args carry only non-secret routing values
-(word counts, page indices).
+(word counts, page indices, which key is being entered).
+
+When encrypting, each key is typed twice and must match: a typo in a key that
+nobody notices until the heir tries to decrypt is unrecoverable. Keys are
+canonicalized by legacy_encryption.canonicalize_key() at entry, exactly as the
+crypto core does, so an empty key is refused here rather than at the end.
 """
 
 import gc
-import time
+import hmac
 import threading
 
 from seedsigner.views.view import View, Destination, BackStackView
@@ -46,8 +52,11 @@ from seedsigner.models.decode_qr import DecodeQR, DecodeQRStatus
 from seedsigner.models.settings import SettingsConstants
 from seedsigner.gui.components import FontAwesomeIconConstants
 from seedsigner.helpers.legacy_encryption import (
+    LegacyError,
+    canonicalize_key,
     encrypt_seed_phrase,
     decrypt_seed_phrase,
+    parse_payload,
     validate_seed_phrase,
     seed_phrase_error,
     encrypted_to_qr_data,
@@ -69,7 +78,7 @@ class _LegacySession:
     """
 
     __slots__ = ("seed_phrase", "benefactor_key", "beneficiary_key",
-                 "encrypted_data", "mode")
+                 "pending_key", "encrypted_data", "mode")
 
     def __init__(self):
         self.clear()
@@ -78,6 +87,7 @@ class _LegacySession:
         self.seed_phrase = None
         self.benefactor_key = None
         self.beneficiary_key = None
+        self.pending_key = None
         self.encrypted_data = None
         self.mode = None
         gc.collect()
@@ -451,7 +461,7 @@ class LegacyEnterSeedWordView(View):
         session = _session(self)
         session.seed_phrase = seed_phrase
         session.mode = "encrypt"
-        return Destination(LegacyEnterBenefactorKeyView)
+        return Destination(LegacyEnterKeyView, view_args={"role": "benefactor"})
 
 
 # ===================================================================
@@ -501,38 +511,85 @@ class LegacyEncryptScanSeedView(View):
         session = _session(self)
         session.seed_phrase = seed_phrase
         session.mode = "encrypt"
-        return Destination(LegacyEnterBenefactorKeyView)
+        return Destination(LegacyEnterKeyView, view_args={"role": "benefactor"})
 
 
-class LegacyEnterBenefactorKeyView(View):
+class LegacyEnterKeyView(View):
+    """
+    Enter one key. ``role`` is "benefactor" or "beneficiary". When encrypting,
+    each key is entered a second time (``confirming=True``) and must match.
+    Only non-secret routing values travel in view_args; the first entry waits
+    in ``session.pending_key`` until it is confirmed.
+    """
+    OK = ButtonOption("OK")
+
+    def __init__(self, role: str = "benefactor", confirming: bool = False):
+        super().__init__()
+        self.role = role
+        self.confirming = confirming
+
     def run(self) -> Destination:
-        ret = self.run_screen(_make_key_entry_screen("Benefactor Key"))
-
-        if ret == RET_CODE__BACK_BUTTON or (isinstance(ret, dict) and ret.get("is_back_button")):
-            return Destination(BackStackView)
-
-        key = ret["passphrase"] if isinstance(ret, dict) else ret
-
-        _session(self).benefactor_key = key
-        return Destination(LegacyEnterBeneficiaryKeyView)
-
-
-class LegacyEnterBeneficiaryKeyView(View):
-    def run(self) -> Destination:
-        ret = self.run_screen(_make_key_entry_screen("Beneficiary Key"))
-
-        if ret == RET_CODE__BACK_BUTTON or (isinstance(ret, dict) and ret.get("is_back_button")):
-            return Destination(BackStackView)
-
-        key = ret["passphrase"] if isinstance(ret, dict) else ret
-
         session = _session(self)
-        session.beneficiary_key = key
+        label = "Benefactor Key" if self.role == "benefactor" else "Beneficiary Key"
+        title = "Confirm Key" if self.confirming else label
 
+        ret = self.run_screen(_make_key_entry_screen(title))
+
+        if ret == RET_CODE__BACK_BUTTON or (isinstance(ret, dict) and ret.get("is_back_button")):
+            if self.confirming:
+                session.pending_key = None
+            return Destination(BackStackView)
+
+        raw = ret["passphrase"] if isinstance(ret, dict) else ret
+        try:
+            key = canonicalize_key(raw, label.lower())
+        except LegacyError as e:
+            self.run_screen(
+                WarningScreen,
+                title="Invalid Key",
+                status_headline="Try Again",
+                text=str(e),
+                button_data=[self.OK],
+            )
+            return Destination(
+                LegacyEnterKeyView,
+                view_args={"role": self.role, "confirming": self.confirming},
+                skip_current_view=True,
+            )
+
+        if session.mode == "encrypt" and not self.confirming:
+            session.pending_key = key
+            return Destination(
+                LegacyEnterKeyView,
+                view_args={"role": self.role, "confirming": True},
+            )
+
+        if self.confirming:
+            first = session.pending_key
+            session.pending_key = None
+            if first is None or not hmac.compare_digest(first.encode(), key.encode()):
+                self.run_screen(
+                    WarningScreen,
+                    title="Keys Differ",
+                    status_headline="No Match",
+                    text=f"The two entries of the {label.lower()} don't match. Enter it again.",
+                    button_data=[self.OK],
+                )
+                # Back to the first-entry screen for this key.
+                return Destination(BackStackView)
+
+        # A confirm screen is left out of history, so "back" from the next
+        # step re-enters that key from the start instead of re-confirming a
+        # value that is no longer pending.
+        skip = self.confirming
+        if self.role == "benefactor":
+            session.benefactor_key = key
+            return Destination(LegacyEnterKeyView, view_args={"role": "beneficiary"}, skip_current_view=skip)
+
+        session.beneficiary_key = key
         if session.mode == "encrypt":
-            return Destination(LegacyConfirmEncryptView)
-        else:
-            return Destination(LegacyDecryptingView)
+            return Destination(LegacyConfirmEncryptView, skip_current_view=skip)
+        return Destination(LegacyDecryptingView)
 
 
 class LegacyConfirmEncryptView(View):
@@ -593,11 +650,12 @@ class LegacyEncryptingView(View):
             _sync_loading_frame(f"Encrypting...  {elapsed}s")
 
         if error_box[0] is not None:
+            err = error_box[0]
             self.run_screen(
                 WarningScreen,
                 title="Encryption Failed",
                 status_headline="Error",
-                text=str(error_box[0]),
+                text=str(err) if isinstance(err, LegacyError) else "Unexpected error. Nothing was produced; try again.",
                 button_data=[self.OK],
             )
             # Keep the session so the user can go back and retry with the same input.
@@ -628,7 +686,7 @@ class LegacyShowEncryptedQRView(View):
             LargeIconStatusScreen,
             title="Get Camera Ready",
             status_headline="Next screen: QR code",
-            text="Get ready to photograph the encrypted QR. You cannot recover your seed without it and BOTH keys.",
+            text="Verified: it decrypts with your keys. Photograph it next. You need it AND both keys to recover.",
             button_data=[self.READY],
         )
 
@@ -701,12 +759,20 @@ class LegacyDecryptScanQRView(View):
 
         encrypted_data = qr_data_to_encrypted(raw_text)
 
-        if not encrypted_data:
+        # Validate the payload now (cheap, no PBKDF2) so a wrong or damaged QR
+        # is caught before the user types two keys.
+        try:
+            parse_payload(encrypted_data)
+        except LegacyError:
+            # Payloads carry no marker, so this only catches what can't be one
+            # (wrong characters or length, e.g. a SeedQR). Anything else is
+            # decided after PBKDF2 by the GCM tag.
+            text = "This isn't a Legacy encrypted QR, or it's incomplete. Scan the encrypted QR, not a SeedQR."
             self.run_screen(
                 WarningScreen,
                 title="Wrong QR",
                 status_headline="Not a Legacy QR",
-                text="This doesn't look like a Legacy Encryption QR. Scan the encrypted QR, not the original SeedQR.",
+                text=text,
                 button_data=[self.OK],
             )
             return Destination(BackStackView)
@@ -714,7 +780,7 @@ class LegacyDecryptScanQRView(View):
         session = _session(self)
         session.encrypted_data = encrypted_data
         session.mode = "decrypt"
-        return Destination(LegacyEnterBenefactorKeyView)
+        return Destination(LegacyEnterKeyView, view_args={"role": "benefactor"})
 
 
 class LegacyDecryptingView(View):
@@ -752,9 +818,16 @@ class LegacyDecryptingView(View):
             _sync_loading_frame(f"Decrypting...  {elapsed}s")
 
         if error_box[0] is not None:
-            msg = str(error_box[0])
-            if any(k in msg.lower() for k in ("tag", "authentication", "invalid")):
-                msg = "Decryption failed. Check that both keys are correct — spelling, capitalization, and spaces all matter."
+            err = error_box[0]
+            code = getattr(err, "code", None)
+            if code == "WRONG_KEYS":
+                msg = "Check both keys (spelling, capitals, punctuation; benefactor first) and that this is a Legacy QR."
+            elif code == "CORRUPT":
+                msg = "Decrypted, but the result is not a valid seed phrase. Check the keys and try again."
+            elif isinstance(err, LegacyError):
+                msg = str(err)
+            else:
+                msg = "Unexpected error during decryption."
             self.run_screen(
                 WarningScreen,
                 title="Decryption Failed",
@@ -763,16 +836,6 @@ class LegacyDecryptingView(View):
                 button_data=[self.OK],
             )
             # Keep the session so the user can go back and retry the keys.
-            return Destination(BackStackView)
-
-        if not validate_seed_phrase(result_box[0]):
-            self.run_screen(
-                WarningScreen,
-                title="Bad Result",
-                status_headline="Check Your Keys",
-                text="Decryption ran but the result is not a valid BIP-39 seed phrase. Double-check both keys and try again.",
-                button_data=[self.OK],
-            )
             return Destination(BackStackView)
 
         # Decryption succeeded: keys and ciphertext are no longer needed.
