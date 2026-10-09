@@ -54,6 +54,7 @@ from seedsigner.gui.components import FontAwesomeIconConstants
 from seedsigner.helpers.legacy_encryption import (
     LegacyError,
     canonicalize_key,
+    key_is_weak,
     encrypt_seed_phrase,
     decrypt_seed_phrase,
     parse_payload,
@@ -522,6 +523,7 @@ class LegacyEnterKeyView(View):
     in ``session.pending_key`` until it is confirmed.
     """
     OK = ButtonOption("OK")
+    USE_IT = ButtonOption("Use it anyway")
 
     def __init__(self, role: str = "benefactor", confirming: bool = False):
         super().__init__()
@@ -577,6 +579,25 @@ class LegacyEnterKeyView(View):
                 )
                 # Back to the first-entry screen for this key.
                 return Destination(BackStackView)
+
+        # Weak-key nudge (encrypt only; dismissible, never blocks). Reached
+        # here after the key is confirmed, so it fires at most once per key.
+        if session.mode == "encrypt" and key_is_weak(key):
+            ret = self.run_screen(
+                WarningScreen,
+                title="Weak Key",
+                status_headline="Could Be Guessed",
+                text=f"This {label.lower()} is short or low-variety. Stronger: "
+                     "several unrelated words. Use it anyway?",
+                button_data=[self.USE_IT],
+            )
+            if ret == RET_CODE__BACK_BUTTON:
+                # Back = re-enter this key from scratch.
+                return Destination(
+                    LegacyEnterKeyView,
+                    view_args={"role": self.role},
+                    skip_current_view=True,
+                )
 
         # A confirm screen is left out of history, so "back" from the next
         # step re-enters that key from the start instead of re-confirming a

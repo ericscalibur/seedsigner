@@ -23,6 +23,7 @@ Dependencies: cryptography
 import base64
 import hashlib
 import hmac
+import math
 import os
 import re
 import secrets
@@ -165,6 +166,47 @@ def _combined_key_bytes(benefactor_key: str, beneficiary_key: str) -> bytes:
     a = canonicalize_key(benefactor_key, "benefactor key")
     b = canonicalize_key(beneficiary_key, "beneficiary key")
     return a.encode("ascii") + bytes([KEY_SEPARATOR]) + b.encode("ascii")
+
+
+# ---------------------------------------------------------------------------
+# Key strength estimate (a nudge, not crypto) — mirrors legacy-core.js.
+# Rewards length and character variety, penalizes repetition, to flag only
+# short / low-variety keys. Not dictionary-aware (too heavy for the Pi Zero);
+# a long single word can slip through. Used for a dismissible warning only;
+# never blocks. Run on a canonical key.
+# ---------------------------------------------------------------------------
+
+WEAK_KEY_BITS = 40
+
+
+def estimate_key_bits(key: str) -> float:
+    s = key if isinstance(key, str) else ""
+    if not s:
+        return 0.0
+    lower = upper = digit = space = symbol = 0
+    for ch in s:
+        c = ord(ch)
+        if 0x61 <= c <= 0x7A:
+            lower = 26
+        elif 0x41 <= c <= 0x5A:
+            upper = 26
+        elif 0x30 <= c <= 0x39:
+            digit = 10
+        elif c == 0x20:
+            space = 1
+        else:
+            symbol = 32
+    pool = lower + upper + digit + space + symbol
+    if pool <= 1:
+        return 0.0
+    unique = len(set(s))
+    eff_len = unique + (len(s) - unique) * 0.5
+    return eff_len * math.log2(pool)
+
+
+def key_is_weak(key: str) -> bool:
+    """True when a key is weak enough to warrant a (dismissible) warning."""
+    return estimate_key_bits(key) < WEAK_KEY_BITS
 
 
 # ---------------------------------------------------------------------------
