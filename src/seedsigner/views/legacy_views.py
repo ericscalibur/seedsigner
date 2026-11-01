@@ -44,6 +44,7 @@ from seedsigner.gui.screens.screen import (
     ButtonOption,
     QRDisplayScreen,
     WarningScreen,
+    DireWarningScreen,
     LargeIconStatusScreen,
     RET_CODE__BACK_BUTTON,
 )
@@ -54,7 +55,7 @@ from seedsigner.gui.components import FontAwesomeIconConstants
 from seedsigner.helpers.legacy_encryption import (
     LegacyError,
     canonicalize_key,
-    key_is_weak,
+    key_strength,
     encrypt_seed_phrase,
     decrypt_seed_phrase,
     parse_payload,
@@ -524,6 +525,7 @@ class LegacyEnterKeyView(View):
     """
     OK = ButtonOption("OK")
     USE_IT = ButtonOption("Use it anyway")
+    CONTINUE = ButtonOption("Continue")
 
     def __init__(self, role: str = "benefactor", confirming: bool = False):
         super().__init__()
@@ -580,17 +582,28 @@ class LegacyEnterKeyView(View):
                 # Back to the first-entry screen for this key.
                 return Destination(BackStackView)
 
-        # Weak-key nudge (encrypt only; dismissible, never blocks). Reached
-        # here after the key is confirmed, so it fires at most once per key.
-        if session.mode == "encrypt" and key_is_weak(key):
-            ret = self.run_screen(
-                WarningScreen,
-                title="Weak Key",
-                status_headline="Could Be Guessed",
-                text=f"This {label.lower()} is short or low-variety. Stronger: "
-                     "several unrelated words. Use it anyway?",
-                button_data=[self.USE_IT],
-            )
+        # Key strength result (encrypt only; informs, never blocks). Reached
+        # here after the key is confirmed, so it shows once per key. Orange
+        # for very weak, yellow for weak, green for good or strong.
+        if session.mode == "encrypt":
+            level, rating = key_strength(key)
+            headline = f"{rating.title()} Key"
+            if level <= 1:
+                ret = self.run_screen(
+                    DireWarningScreen if level == 0 else WarningScreen,
+                    title=label,
+                    status_headline=headline,
+                    text="Could be guessed. Several random words are stronger.",
+                    button_data=[self.USE_IT],
+                )
+            else:
+                ret = self.run_screen(
+                    LargeIconStatusScreen,
+                    title=label,
+                    status_headline=headline,
+                    text="An estimate only. It can't spot personal details.",
+                    button_data=[self.CONTINUE],
+                )
             if ret == RET_CODE__BACK_BUTTON:
                 # Back = re-enter this key from scratch.
                 return Destination(

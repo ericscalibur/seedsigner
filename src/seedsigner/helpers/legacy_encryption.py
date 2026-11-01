@@ -170,13 +170,26 @@ def _combined_key_bytes(benefactor_key: str, beneficiary_key: str) -> bytes:
 
 # ---------------------------------------------------------------------------
 # Key strength estimate (a nudge, not crypto) — mirrors legacy-core.js.
-# Rewards length and character variety, penalizes repetition, to flag only
-# short / low-variety keys. Not dictionary-aware (too heavy for the Pi Zero);
-# a long single word can slip through. Used for a dismissible warning only;
-# never blocks. Run on a canonical key.
+# Rewards length and character variety, penalizes repetition, and caps the most
+# common passwords and their obvious variations. Not dictionary-aware in general
+# (too heavy for the Pi Zero); a long single word can still score well. Used for
+# a dismissible warning only; never blocks. Run on a canonical key.
 # ---------------------------------------------------------------------------
 
-WEAK_KEY_BITS = 40
+WEAK_KEY_BITS = 60
+STRONG_KEY_BITS = 80
+VERY_WEAK_KEY_BITS = 40
+COMMON_KEY_BITS = 20
+COMMON_KEY_BASES = frozenset({
+    "password", "passphrase", "qwerty", "letmein", "admin", "welcome", "iloveyou",
+    "monkey", "dragon", "sunshine", "bitcoin", "satoshi", "hodl", "secret",
+})
+LOOKALIKES = str.maketrans("013457@$", "oieastas")
+
+
+def _is_common_key(key: str) -> bool:
+    base = re.sub(r"[^a-z]+\Z", "", key.lower()).translate(LOOKALIKES)
+    return re.sub(r"[^a-z]", "", base) in COMMON_KEY_BASES
 
 
 def estimate_key_bits(key: str) -> float:
@@ -201,12 +214,25 @@ def estimate_key_bits(key: str) -> float:
         return 0.0
     unique = len(set(s))
     eff_len = unique + (len(s) - unique) * 0.5
-    return eff_len * math.log2(pool)
+    bits = eff_len * math.log2(pool)
+    return min(bits, COMMON_KEY_BITS) if _is_common_key(s) else bits
 
 
 def key_is_weak(key: str) -> bool:
     """True when a key is weak enough to warrant a (dismissible) warning."""
     return estimate_key_bits(key) < WEAK_KEY_BITS
+
+
+def key_strength(key: str) -> tuple:
+    """(level, label), from (0, "Very weak") to (3, "Strong")."""
+    bits = estimate_key_bits(key)
+    if bits >= STRONG_KEY_BITS:
+        return 3, "Strong"
+    if bits >= WEAK_KEY_BITS:
+        return 2, "Good"
+    if bits >= VERY_WEAK_KEY_BITS:
+        return 1, "Weak"
+    return 0, "Very weak"
 
 
 # ---------------------------------------------------------------------------
